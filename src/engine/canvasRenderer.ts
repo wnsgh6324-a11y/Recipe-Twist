@@ -27,6 +27,24 @@ export function preloadStyleBackdrops(): void {
   }
 }
 
+export async function waitForStyleBackdrop(style: AnimationStyle): Promise<void> {
+  if (typeof window === "undefined") return;
+  preloadStyleBackdrops();
+  const img = backdropCache.get(style);
+  if (!img) return;
+  if (img.complete && img.naturalWidth > 0) return;
+
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), 4000);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    img.addEventListener("load", done, { once: true });
+    img.addEventListener("error", done, { once: true });
+  });
+}
+
 function getBackdropImage(style: AnimationStyle): HTMLImageElement | null {
   const cached = backdropCache.get(style);
   if (cached && cached.complete && cached.naturalWidth > 0) {

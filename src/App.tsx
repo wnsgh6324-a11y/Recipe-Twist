@@ -13,8 +13,10 @@ import type {
 } from "./types/story";
 import { preloadStyleBackdrops } from "./engine/canvasRenderer";
 import {
+  buildCompositeVideo,
   computeSceneTimings,
   measureBase64Duration,
+  type GeneratedVideoArtifact,
 } from "./engine/videoComposer";
 import { TopBar } from "./components/TopBar";
 import { ExpressionsSection } from "./components/ExpressionsSection";
@@ -27,6 +29,8 @@ export default function App() {
     useState<ExpressionItem[]>(DEFAULT_EXPRESSIONS);
   const [scenes, setScenes] = useState<SceneItem[]>(DEFAULT_SCENES);
   const [style, setStyle] = useState<AnimationStyle>("2d");
+  const [generatedVideo, setGeneratedVideo] =
+    useState<GeneratedVideoArtifact | null>(null);
 
   const [regeneratingSceneNum, setRegeneratingSceneNum] = useState<
     number | null
@@ -39,16 +43,32 @@ export default function App() {
 
   const scenesRef = useRef(scenes);
   scenesRef.current = scenes;
-  const prewarmStartedRef = useRef(false);
+  const styleRef = useRef(style);
+  styleRef.current = style;
 
   useEffect(() => {
     preloadStyleBackdrops();
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (generatedVideo?.url) {
+        URL.revokeObjectURL(generatedVideo.url);
+      }
+    };
+  }, [generatedVideo]);
+
+  const invalidateGeneratedVideo = useCallback(() => {
+    setGeneratedVideo((prev) => {
+      if (prev?.url) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+  }, []);
+
   const timings = useMemo(() => computeSceneTimings(scenes), [scenes]);
 
   const fetchVoiceForScene = useCallback(
-    async (scene: SceneItem): Promise<SceneItem> => {
+    async (scene: SceneItem, targetStyle: AnimationStyle): Promise<SceneItem> => {
       const res = await fetch("/api/tts/scene", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -95,10 +115,10 @@ export default function App() {
         ...scene,
         lines: enrichedLines,
         clipReady: true,
-        generatedStyle: style,
+        generatedStyle: targetStyle,
       };
     },
-    [style]
+    []
   );
 
   const handleEnsureSceneVoice = useCallback(
@@ -113,7 +133,7 @@ export default function App() {
 
       setApiError(null);
       try {
-        const updated = await fetchVoiceForScene(target);
+        const updated = await fetchVoiceForScene(target, styleRef.current);
         setScenes((prev) =>
           prev.map((s) => (s.sceneNumber === sceneNumber ? updated : s))
         );
@@ -130,58 +150,74 @@ export default function App() {
     [fetchVoiceForScene]
   );
 
-  const handleGenerateAllClips = useCallback(
-    async (silent = false): Promise<boolean> => {
-      if (!silent) {
-        setApiError(null);
-      }
-      setIsGeneratingAll(true);
+  const handleGenerateAllClips = useCallback(async (): Promise<GeneratedVideoArtifact | null> => {
+    setApiError(null);
+    setIsGeneratingAll(true);
 
-      try {
-        const currentScenes = scenesRef.current;
-        for (let i = 0; i < currentScenes.length; i++) {
-          const latestScene = scenesRef.current[i];
-          if (silent && latestScene.lines.every((l) => Boolean(l.audioBase64))) {
-            continue;
-          }
-          setGenerationProgress(
-            `Clip ${latestScene.sceneNumber}/4 (${latestScene.startSec}–${latestScene.endSec}s)…`
-          );
+    try {
+      const targetStyle = styleRef.current;
+      const workingScenes: SceneItem[] = [...scenesRef.current];
 
-          const updatedScene = await fetchVoiceForScene(latestScene);
-          setScenes((prev) =>
-            prev.map((s) =>
-              s.sceneNumber === updatedScene.sceneNumber ? updatedScene : s
-            )
-          );
+      for (let i = 0; i < workingScenes.length; i++) {
+        const latestScene = scenesRef.current[i];
+        const hasAllLineAudio = latestScene.lines.every((l) =>
+          Boolean(l.audioBase64)
+        );
+
+        if (hasAllLineAudio) {
+          workingScenes[i] = {
+            ...latestScene,
+            clipReady: true,
+            generatedStyle: targetStyle,
+          };
+          continue;
         }
 
-        setGenerationProgress("Combining 4 clips…");
-        await new Promise((r) => setTimeout(r, 200));
-        return true;
-      } catch (err: unknown) {
-        if (!silent) {
-          setApiError(
-            err instanceof Error
-              ? err.message
-              : "Failed to generate video voices."
-          );
-        }
-        return false;
-      } finally {
-        setIsGeneratingAll(false);
-        setGenerationProgress(null);
-      }
-    },
-    [fetchVoiceForScene]
-  );
+        setGenerationProgress(
+          `Generating voice ${latestScene.sceneNumber}/4 (${latestScene.startSec}–${latestScene.endSec}s)…`
+        );
 
-  // Pre-synthesize the 4 default scenes' voices on initial load so Play works immediately with sound
-  useEffect(() => {
-    if (prewarmStartedRef.current) return;
-    prewarmStartedRef.current = true;
-    handleGenerateAllClips(true);
-  }, [handleGenerateAllClips]);
+        const updatedScene = await fetchVoiceForScene(latestScene, targetStyle);
+        workingScenes[i] = updatedScene;
+        setScenes((prev) =>
+          prev.map((s) =>
+            s.sceneNumber === updatedScene.sceneNumber ? updatedScene : s
+          )
+        );
+      }
+
+      const finalTimings = computeSceneTimings(workingScenes);
+      setGenerationProgress("Rendering 30s video… 0%");
+
+      const artifact = await buildCompositeVideo({
+        style: targetStyle,
+        scenes: workingScenes,
+        timings: finalTimings,
+        onProgress: (percent) =>
+          setGenerationProgress(`Rendering 30s video… ${percent}%`),
+      });
+
+      setGeneratedVideo((prev) => {
+        if (prev?.url) URL.revokeObjectURL(prev.url);
+        return artifact;
+      });
+      return artifact;
+    } catch (err: unknown) {
+      setApiError(
+        err instanceof Error ? err.message : "Failed to generate 30s video."
+      );
+      return null;
+    } finally {
+      setIsGeneratingAll(false);
+      setGenerationProgress(null);
+    }
+  }, [fetchVoiceForScene]);
+
+  const handleSelectStyle = (nextStyle: AnimationStyle) => {
+    if (nextStyle === style) return;
+    setStyle(nextStyle);
+    invalidateGeneratedVideo();
+  };
 
   const handleUpdateExpression = (
     id: string,
@@ -200,6 +236,7 @@ export default function App() {
     sceneNumber: 1 | 2 | 3 | 4,
     patch: Partial<SceneItem>
   ) => {
+    invalidateGeneratedVideo();
     setScenes((prev) =>
       prev.map((s) => (s.sceneNumber === sceneNumber ? { ...s, ...patch } : s))
     );
@@ -210,11 +247,13 @@ export default function App() {
     lineId: string,
     patch: Partial<DialogueLine>
   ) => {
+    invalidateGeneratedVideo();
     setScenes((prev) =>
       prev.map((s) =>
         s.sceneNumber === sceneNumber
           ? {
               ...s,
+              clipReady: false,
               lines: s.lines.map((l) =>
                 l.id === lineId ? { ...l, ...patch } : l
               ),
@@ -230,6 +269,7 @@ export default function App() {
 
     setApiError(null);
     setRegeneratingSceneNum(sceneNumber);
+    invalidateGeneratedVideo();
 
     try {
       const res = await fetch("/api/scene/regenerate", {
@@ -331,7 +371,7 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   jumpToStudio();
-                  handleGenerateAllClips(false);
+                  void handleGenerateAllClips();
                 }}
                 disabled={isGeneratingAll}
                 className="inline-flex min-h-[48px] items-center gap-2 rounded-xl bg-[var(--accent-coral)] px-6 py-3 text-base font-semibold text-white shadow-sm transition-colors hover:bg-[var(--accent-coral-hover)] disabled:opacity-60 cursor-pointer"
@@ -385,12 +425,14 @@ export default function App() {
 
         <VideoStudioSection
           style={style}
-          onSelectStyle={setStyle}
+          onSelectStyle={handleSelectStyle}
           scenes={scenes}
           timings={timings}
+          generatedVideo={generatedVideo}
           isGeneratingAll={isGeneratingAll}
           generationProgress={generationProgress}
-          onGenerateAllClips={() => handleGenerateAllClips(false)}
+          generationError={apiError}
+          onGenerateAllClips={handleGenerateAllClips}
         />
       </main>
 

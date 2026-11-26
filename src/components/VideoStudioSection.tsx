@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  AlertCircle,
   Download,
   Film,
   Pause,
@@ -7,21 +8,22 @@ import {
   RotateCcw,
   Volume2,
   VolumeX,
-  X,
 } from "lucide-react";
 import type { AnimationStyle, SceneItem } from "../types/story";
 import { ANIMATION_STYLES, STORY_TITLE } from "../data/defaultStory";
 import { renderFrame, type TimedLine } from "../engine/canvasRenderer";
-import { decodeWavBase64, exportCompositeVideo } from "../engine/videoComposer";
+import type { GeneratedVideoArtifact } from "../engine/videoComposer";
 
 interface VideoStudioSectionProps {
   style: AnimationStyle;
   onSelectStyle: (style: AnimationStyle) => void;
   scenes: SceneItem[];
   timings: TimedLine[];
+  generatedVideo: GeneratedVideoArtifact | null;
   isGeneratingAll: boolean;
   generationProgress: string | null;
-  onGenerateAllClips: () => Promise<boolean>;
+  generationError: string | null;
+  onGenerateAllClips: () => Promise<GeneratedVideoArtifact | null>;
 }
 
 function formatTimecode(sec: number): string {
@@ -35,249 +37,140 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
   onSelectStyle,
   scenes,
   timings,
+  generatedVideo,
   isGeneratingAll,
   generationProgress,
+  generationError,
   onGenerateAllClips,
 }) => {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const pendingAutoPlayRef = useRef(false);
+
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [showKoreanStudy, setShowKoreanStudy] = useState(true);
-
-  const [isExporting, setIsExporting] = useState(false);
-  const [exportSec, setExportSec] = useState(0);
-  const [exportError, setExportError] = useState<string | null>(null);
-  const [exportedVideo, setExportedVideo] = useState<{
-    url: string;
-    extension: string;
-  } | null>(null);
-
-  const abortRef = useRef<AbortController | null>(null);
-  const playOffsetRef = useRef(0);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const gainNodeRef = useRef<GainNode | null>(null);
+  const [playerError, setPlayerError] = useState<string | null>(null);
 
   const voicesReadyCount = scenes.filter((s) =>
     s.lines.every((l) => Boolean(l.audioBase64))
   ).length;
 
-  const ensureUnlockedAudioContext = async (): Promise<AudioContext> => {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
-      audioCtxRef.current = new AudioCtx();
-      const gain = audioCtxRef.current.createGain();
-      gain.gain.value = isMuted ? 0 : 1;
-      gain.connect(audioCtxRef.current.destination);
-      gainNodeRef.current = gain;
+  // Reset player position when video artifact changes or is cleared
+  useEffect(() => {
+    setIsPlaying(false);
+    setCurrentTime(0);
+    if (generatedVideo) {
+      setPlayerError(null);
     }
-    if (audioCtxRef.current.state === "suspended") {
-      await audioCtxRef.current.resume();
-    }
-    return audioCtxRef.current;
-  };
+  }, [generatedVideo]);
 
+  // Paint preview canvas frame when no generated video exists yet
   useEffect(() => {
-    if (gainNodeRef.current) {
-      gainNodeRef.current.gain.value = isMuted ? 0 : 1;
-    }
-  }, [isMuted]);
-
-  useEffect(() => {
-    return () => {
-      audioCtxRef.current?.close().catch(() => {});
-    };
-  }, []);
-
-  // Clear cached export when scenes or style change
-  useEffect(() => {
-    setExportedVideo((prev) => {
-      if (prev) URL.revokeObjectURL(prev.url);
-      return null;
-    });
-  }, [style, scenes]);
-
-  // Paint current frame when paused
-  useEffect(() => {
-    if (isPlaying) return;
-    const canvas = canvasRef.current;
+    if (generatedVideo) return;
+    const canvas = previewCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     renderFrame(ctx, canvas.width, canvas.height, currentTime, style, scenes, timings);
-  }, [currentTime, isPlaying, style, scenes, timings]);
+  }, [generatedVideo, currentTime, style, scenes, timings]);
 
-  // Synchronized 30s playback loop (Canvas + WebAudio English voices)
+  // Sync mute state with <video> element
   useEffect(() => {
-    if (!isPlaying) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    if (videoRef.current) {
+      videoRef.current.muted = isMuted;
+    }
+  }, [isMuted]);
 
-    let cancelled = false;
-    let rafId = 0;
-    const activeSources: AudioBufferSourceNode[] = [];
-    const startOffset = playOffsetRef.current >= 29.8 ? 0 : playOffsetRef.current;
-    const startPerf = performance.now();
-
-    (async () => {
-      const audioCtx = await ensureUnlockedAudioContext();
-      const targetNode = gainNodeRef.current ?? audioCtx.destination;
-
-      for (const timing of timings) {
-        if (cancelled) return;
-        if (timing.endSec <= startOffset + 0.05) continue;
-        if (!timing.line.audioBase64) continue;
-
-        try {
-          const buffer = await decodeWavBase64(audioCtx, timing.line.audioBase64);
-          if (cancelled) return;
-          const src = audioCtx.createBufferSource();
-          src.buffer = buffer;
-
-          const slotDuration = Math.max(0.5, timing.endSec - timing.startSec);
-          const rate =
-            buffer.duration > slotDuration
-              ? Math.min(1.35, buffer.duration / slotDuration)
-              : 1;
-          src.playbackRate.value = rate;
-          src.connect(targetNode);
-
-          const currentPlayhead = startOffset + (performance.now() - startPerf) / 1000;
-          const delay = timing.startSec - currentPlayhead;
-          if (delay >= 0) {
-            src.start(audioCtx.currentTime + delay);
-          } else {
-            const skipSec = -delay * rate;
-            if (skipSec < buffer.duration) {
-              src.start(audioCtx.currentTime, skipSec);
-            }
-          }
-          activeSources.push(src);
-        } catch {
-          // Ignore unreadable audio buffer
-        }
+  const attemptVideoPlay = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    setPlayerError(null);
+    try {
+      video.muted = isMuted;
+      if (video.currentTime >= 29.8) {
+        video.currentTime = 0;
+        setCurrentTime(0);
       }
-    })();
-
-    const tick = () => {
-      if (cancelled) return;
-      const elapsed = (performance.now() - startPerf) / 1000;
-      const nextTime = Math.min(30, startOffset + elapsed);
-      playOffsetRef.current = nextTime;
-      setCurrentTime(nextTime);
-      renderFrame(ctx, canvas.width, canvas.height, nextTime, style, scenes, timings);
-
-      if (nextTime >= 30) {
-        setIsPlaying(false);
-        playOffsetRef.current = 0;
-        return;
-      }
-      rafId = requestAnimationFrame(tick);
-    };
-
-    rafId = requestAnimationFrame(tick);
-
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(rafId);
-      for (const s of activeSources) {
-        try {
-          s.stop();
-        } catch {
-          // Already stopped
-        }
-      }
-    };
-  }, [isPlaying, style, scenes, timings]);
+      await video.play();
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : "브라우저에서 영상 재생을 시작하지 못했습니다.";
+      setPlayerError(
+        `영상을 재생할 수 없습니다: ${msg}. 재생 버튼을 다시 눌러 주세요.`
+      );
+      setIsPlaying(false);
+    }
+  };
 
   const handleTogglePlay = async () => {
-    if (isPlaying) {
-      setIsPlaying(false);
+    if (!generatedVideo?.url) {
+      setPlayerError(
+        "재생할 영상 파일이 아직 생성되지 않았습니다. 먼저 'Generate 4 Clips & Voices' 버튼을 눌러 30초 영상을 생성해 주세요."
+      );
       return;
     }
 
-    // Unlock AudioContext immediately inside user click event
-    await ensureUnlockedAudioContext();
-
-    // Auto-generate voices first if any scene doesn't have voice audio yet
-    if (voicesReadyCount < 4) {
-      const ok = await onGenerateAllClips();
-      if (!ok) return;
+    const video = videoRef.current;
+    if (!video) {
+      setPlayerError("비디오 플레이어를 초기화하지 못했습니다. 페이지를 새로고침해 주세요.");
+      return;
     }
 
-    if (currentTime >= 29.8) {
-      playOffsetRef.current = 0;
-      setCurrentTime(0);
-    } else {
-      playOffsetRef.current = currentTime;
+    if (!video.paused && !video.ended) {
+      video.pause();
+      return;
     }
-    setIsPlaying(true);
+
+    await attemptVideoPlay();
   };
 
-  const handleSeek = async (sec: number) => {
+  const handleGenerateAndPlay = async () => {
+    setPlayerError(null);
+    pendingAutoPlayRef.current = true;
+    const artifact = await onGenerateAllClips();
+    if (!artifact) {
+      pendingAutoPlayRef.current = false;
+    }
+  };
+
+  const handleVideoCanPlay = () => {
+    if (pendingAutoPlayRef.current) {
+      pendingAutoPlayRef.current = false;
+      void attemptVideoPlay();
+    }
+  };
+
+  const handleSeek = (sec: number) => {
     const clamped = Math.max(0, Math.min(30, sec));
-    playOffsetRef.current = clamped;
     setCurrentTime(clamped);
-    if (isPlaying) {
-      await ensureUnlockedAudioContext();
-      setIsPlaying(false);
-      setTimeout(() => setIsPlaying(true), 20);
+    if (videoRef.current && generatedVideo?.url) {
+      videoRef.current.currentTime = clamped;
     }
   };
 
-  const triggerDownload = (url: string, extension: string) => {
+  const triggerDownload = (artifact: GeneratedVideoArtifact) => {
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `Recipe-Twist-30s-${style}.${extension}`;
+    a.href = artifact.url;
+    a.download = `Recipe-Twist-30s-${artifact.style}.${artifact.extension}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   };
 
-  const handleExportAndDownload = async () => {
-    if (exportedVideo) {
-      triggerDownload(exportedVideo.url, exportedVideo.extension);
+  const handleDownload = async () => {
+    setPlayerError(null);
+    if (generatedVideo) {
+      triggerDownload(generatedVideo);
       return;
     }
 
-    setIsPlaying(false);
-    setExportError(null);
-
-    if (voicesReadyCount < 4) {
-      const ok = await onGenerateAllClips();
-      if (!ok) return;
-    }
-
-    setIsExporting(true);
-    setExportSec(0);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      const { blob, extension } = await exportCompositeVideo({
-        style,
-        scenes,
-        timings,
-        signal: controller.signal,
-        onProgress: (elapsed) => setExportSec(elapsed),
-      });
-      const url = URL.createObjectURL(blob);
-      setExportedVideo({ url, extension });
-      triggerDownload(url, extension);
-    } catch (err: unknown) {
-      if (!controller.signal.aborted) {
-        setExportError(
-          err instanceof Error ? err.message : "Could not export video."
-        );
-      }
-    } finally {
-      setIsExporting(false);
-      abortRef.current = null;
+    const artifact = await onGenerateAllClips();
+    if (artifact) {
+      triggerDownload(artifact);
     }
   };
 
@@ -287,6 +180,8 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
   const activeTiming = timings.find(
     (t) => currentTime >= t.startSec && currentTime <= t.endSec
   );
+
+  const visibleError = playerError || generationError;
 
   return (
     <section
@@ -310,8 +205,8 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
           type="button"
           disabled={isGeneratingAll}
           onClick={() => {
-            ensureUnlockedAudioContext().catch(() => {});
-            onGenerateAllClips();
+            setPlayerError(null);
+            void onGenerateAllClips();
           }}
           className="inline-flex min-h-[48px] items-center justify-center gap-2 rounded-xl bg-[var(--accent-coral)] px-5 py-3 text-base font-semibold text-white shadow-sm transition-colors hover:bg-[var(--accent-coral-hover)] disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
         >
@@ -319,8 +214,8 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
           <span>
             {isGeneratingAll
               ? generationProgress || "Generating…"
-              : voicesReadyCount === 4
-                ? "Regenerate All 4 Clips & Voices"
+              : generatedVideo
+                ? "Regenerate 30s Video"
                 : "Generate 4 Clips & Voices"}
           </span>
         </button>
@@ -389,7 +284,11 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
                 ·
               </span>
               <span>
-                {voicesReadyCount}/4 voiced clips combined
+                {generatedVideo
+                  ? `Ready (${generatedVideo.extension.toUpperCase()} · ${(generatedVideo.sizeBytes / (1024 * 1024)).toFixed(1)} MB)`
+                  : voicesReadyCount > 0
+                    ? `${voicesReadyCount}/4 voices ready · Video not built`
+                    : "Video not generated yet"}
               </span>
             </p>
           </div>
@@ -405,21 +304,82 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
           </label>
         </div>
 
+        {/* Video Stage: renders real <video> when generated, or preview canvas when not yet generated */}
         <div className="relative overflow-hidden rounded-2xl bg-[#1F1B18]">
-          <canvas
-            ref={canvasRef}
-            width={1280}
-            height={720}
-            className="block aspect-video w-full"
-          />
+          {generatedVideo?.url ? (
+            <video
+              ref={videoRef}
+              src={generatedVideo.url}
+              playsInline
+              preload="auto"
+              onCanPlay={handleVideoCanPlay}
+              onTimeUpdate={() => {
+                if (videoRef.current) {
+                  setCurrentTime(videoRef.current.currentTime);
+                }
+              }}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onEnded={() => {
+                setIsPlaying(false);
+                setCurrentTime(30);
+              }}
+              onError={() => {
+                setIsPlaying(false);
+                setPlayerError(
+                  "생성된 영상 파일을 디코딩하지 못했습니다. 'Regenerate 30s Video' 버튼을 눌러 다시 생성해 주세요."
+                );
+              }}
+              className="block aspect-video w-full bg-[#1F1B18]"
+            />
+          ) : (
+            <div className="relative">
+              <canvas
+                ref={previewCanvasRef}
+                width={1280}
+                height={720}
+                className="block aspect-video w-full opacity-90"
+              />
+              <div className="absolute inset-x-0 top-4 flex justify-center px-4">
+                <p className="rounded-xl bg-black/75 px-4 py-2 text-center text-xs font-medium text-white backdrop-blur-sm sm:text-sm">
+                  {isGeneratingAll
+                    ? generationProgress || "30초 영상과 영어 음성을 생성하고 있습니다…"
+                    : "아직 30초 영상이 생성되지 않았습니다. 'Generate 4 Clips & Voices'를 눌러 영상을 만들어 주세요."}
+                </p>
+              </div>
+            </div>
+          )}
         </div>
+
+        {visibleError && (
+          <div
+            role="alert"
+            className="mt-4 flex flex-col gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3.5 text-sm text-red-900 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-700" aria-hidden="true" />
+              <span className="font-korean leading-relaxed">{visibleError}</span>
+            </div>
+
+            {!generatedVideo?.url && !isGeneratingAll && (
+              <button
+                type="button"
+                onClick={handleGenerateAndPlay}
+                className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent-coral)] px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-[var(--accent-coral-hover)] cursor-pointer"
+              >
+                <Play className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
+                <span>Generate &amp; Play Now</span>
+              </button>
+            )}
+          </div>
+        )}
 
         {showKoreanStudy && (
           <div className="mt-3 rounded-xl bg-[var(--bg-subtle)] px-4 py-3 text-center">
             <p className="font-korean text-base font-medium text-[var(--text-primary)]">
               {activeTiming
                 ? `${activeTiming.line.speaker}: ${activeTiming.line.koreanText}`
-                : "재생을 눌러 30초 애니메이션과 영어 음성을 확인해 보세요."}
+                : "영상을 생성하고 재생하면 장면에 맞는 한국어 자막이 함께 표시됩니다."}
             </p>
           </div>
         )}
@@ -482,7 +442,7 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
               className="inline-flex min-h-[48px] items-center gap-2 rounded-xl bg-[var(--text-primary)] px-5 py-2.5 text-base font-semibold text-white transition-colors hover:bg-[#313834] disabled:opacity-60 cursor-pointer"
             >
               {isGeneratingAll ? (
-                <span>{generationProgress || "Loading Voices…"}</span>
+                <span>{generationProgress || "Generating Video…"}</span>
               ) : isPlaying ? (
                 <>
                   <Pause className="h-5 w-5 fill-current" aria-hidden="true" />
@@ -520,44 +480,19 @@ export const VideoStudioSection: React.FC<VideoStudioSectionProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            {isExporting ? (
-              <div className="flex items-center gap-3 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-4 py-2 min-h-[48px]">
-                <span className="font-mono-tabular text-sm font-semibold text-[var(--text-primary)]">
-                  Exporting {Math.round(exportSec)}s / 30s…
-                </span>
-                <button
-                  type="button"
-                  onClick={() => abortRef.current?.abort()}
-                  aria-label="Cancel video export"
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-black/10 cursor-pointer"
-                >
-                  <X className="h-4 w-4" aria-hidden="true" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                disabled={isGeneratingAll}
-                onClick={handleExportAndDownload}
-                className="inline-flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent-sage)] px-5 py-2.5 text-base font-semibold text-white shadow-sm transition-colors hover:bg-[#3d6555] disabled:opacity-60 sm:w-auto cursor-pointer"
-              >
-                <Download className="h-5 w-5" aria-hidden="true" />
-                <span>
-                  {exportedVideo ? "Download Video Again" : "Download Video"}
-                </span>
-              </button>
-            )}
+            <button
+              type="button"
+              disabled={isGeneratingAll}
+              onClick={handleDownload}
+              className="inline-flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent-sage)] px-5 py-2.5 text-base font-semibold text-white shadow-sm transition-colors hover:bg-[#3d6555] disabled:opacity-60 sm:w-auto cursor-pointer"
+            >
+              <Download className="h-5 w-5" aria-hidden="true" />
+              <span>
+                {generatedVideo ? "Download Video" : "Generate & Download Video"}
+              </span>
+            </button>
           </div>
         </div>
-
-        {exportError && (
-          <div
-            role="alert"
-            className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
-          >
-            {exportError}
-          </div>
-        )}
 
         {/* Final Screen Required Attribution */}
         <div className="mt-6 border-t border-[var(--border-hairline)] pt-4 text-center">

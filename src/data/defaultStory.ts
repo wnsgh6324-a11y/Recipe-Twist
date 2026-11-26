@@ -128,7 +128,7 @@ export const DEFAULT_SCENES: SceneItem[] = [
     title: "Pre-Contest Jitters",
     description:
       "Inside the sunlit university cooking studio, Mia spots the judges arriving near their counter and feels nervous, while Alex calms her down beside a fresh stack of golden pancakes.",
-    clipReady: true,
+    clipReady: false,
     lines: [
       {
         id: "s1-l1",
@@ -157,7 +157,7 @@ export const DEFAULT_SCENES: SceneItem[] = [
     title: "Topping Disagreement",
     description:
       "Alex reaches for a bowl of savory pizza-style toppings to put on their sweet pancakes, and Mia firmly shakes her head to keep the dessert clean and balanced.",
-    clipReady: true,
+    clipReady: false,
     lines: [
       {
         id: "s2-l1",
@@ -179,7 +179,7 @@ export const DEFAULT_SCENES: SceneItem[] = [
     title: "The Citrus Twist",
     description:
       "They notice the strawberry basket is completely empty. Thinking fast, Alex picks up a bright fresh orange and asks Mia for the zester to finish the pancakes with fragrant orange zest.",
-    clipReady: true,
+    clipReady: false,
     lines: [
       {
         id: "s3-l1",
@@ -201,7 +201,7 @@ export const DEFAULT_SCENES: SceneItem[] = [
     title: "Unexpected Praise",
     description:
       "The judge takes a careful bite of the warm orange-zest pancakes, lights up with genuine delight, and leaves Mia speechless with joy.",
-    clipReady: true,
+    clipReady: false,
     lines: [
       {
         id: "s4-l1",
