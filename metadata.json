@@ -1,0 +1,6 @@
+{
+  "name": "Recipe Twist",
+  "description": "Turn movie expressions into a 30-second original animated English-learning video with voices and subtitles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
