@@ -23,6 +23,7 @@ import { ExpressionsSection } from "./components/ExpressionsSection";
 import { StorySection } from "./components/StorySection";
 import { StoryboardSection } from "./components/StoryboardSection";
 import { VideoStudioSection } from "./components/VideoStudioSection";
+import { postJson } from "./utils/apiClient";
 
 export default function App() {
   const [expressions, setExpressions] =
@@ -69,29 +70,16 @@ export default function App() {
 
   const fetchVoiceForScene = useCallback(
     async (scene: SceneItem, targetStyle: AnimationStyle): Promise<SceneItem> => {
-      const res = await fetch("/api/tts/scene", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lines: scene.lines.map((l) => ({
-            id: l.id,
-            speaker: l.speaker,
-            text: l.text,
-            styleHint: l.styleHint,
-          })),
-        }),
-      });
-
-      const data = (await res.json()) as {
+      const data = await postJson<{
         audioLines?: Array<{ id: string; audioBase64: string }>;
-        error?: string;
-      };
-
-      if (!res.ok) {
-        throw new Error(
-          data.error || `Failed generating voices for Scene ${scene.sceneNumber}.`
-        );
-      }
+      }>("/api/tts/scene", {
+        lines: scene.lines.map((l) => ({
+          id: l.id,
+          speaker: l.speaker,
+          text: l.text,
+          styleHint: l.styleHint,
+        })),
+      });
 
       const enrichedLines: DialogueLine[] = [];
       for (const line of scene.lines) {
@@ -272,19 +260,7 @@ export default function App() {
     invalidateGeneratedVideo();
 
     try {
-      const res = await fetch("/api/scene/regenerate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sceneNumber: target.sceneNumber,
-          label: target.label,
-          description: target.description,
-          lines: target.lines,
-          expressions,
-        }),
-      });
-
-      const data = (await res.json()) as {
+      const data = await postJson<{
         description?: string;
         lines?: Array<{
           id: string;
@@ -294,12 +270,13 @@ export default function App() {
           expressionId?: string;
         }>;
         audioLines?: Array<{ id: string; audioBase64: string }>;
-        error?: string;
-      };
-
-      if (!res.ok) {
-        throw new Error(data.error || "Scene regeneration failed.");
-      }
+      }>("/api/scene/regenerate", {
+        sceneNumber: target.sceneNumber,
+        label: target.label,
+        description: target.description,
+        lines: target.lines,
+        expressions,
+      });
 
       const durations = new Map<string, number>();
       for (const audio of data.audioLines ?? []) {

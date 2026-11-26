@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Check, Pencil, RotateCcw, Languages } from "lucide-react";
 import type { ExpressionItem } from "../types/story";
+import { postJson } from "../utils/apiClient";
 
 interface ExpressionsSectionProps {
   expressions: ExpressionItem[];
@@ -21,22 +22,13 @@ export const ExpressionsSection: React.FC<ExpressionsSectionProps> = ({
     setTranslatingId(item.id);
     setErrorMsg(null);
     try {
-      const res = await fetch("/api/expressions/translate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          phrase: item.phrase,
-          sourceMovie: item.sourceMovie,
-        }),
-      });
-      const data = (await res.json()) as {
+      const data = await postJson<{
         koreanMeaning?: string;
         nuanceNote?: string;
-        error?: string;
-      };
-      if (!res.ok) {
-        throw new Error(data.error || "Unable to update Korean meaning.");
-      }
+      }>("/api/expressions/translate", {
+        phrase: item.phrase,
+        sourceMovie: item.sourceMovie,
+      });
       onUpdateExpression(item.id, {
         koreanMeaning: data.koreanMeaning || item.koreanMeaning,
         nuanceNote: data.nuanceNote || item.nuanceNote,
